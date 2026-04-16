@@ -10,12 +10,7 @@ export async function fetchPosts({
 
   let query = supabase
     .from("posts")
-    .select(`
-      id, title, slug, excerpt, cover_image_url, created_at, published, author_id,
-      profiles!posts_author_id_fkey(username, display_name),
-      post_likes(count),
-      comments(count)
-    `, { count: "exact" })
+    .select("id, title, slug, excerpt, cover_image_url, created_at, published, author_id, post_likes(count), comments(count)", { count: "exact" })
     .eq("published", true)
     .order("created_at", { ascending: false })
     .range(from, to);
@@ -27,6 +22,14 @@ export async function fetchPosts({
   const { data, count, error } = await query;
   if (error) throw error;
 
+  // Fetch author profiles
+  const authorIds = [...new Set((data ?? []).map((p) => p.author_id))];
+  const { data: profiles } = authorIds.length > 0
+    ? await supabase.from("profiles").select("user_id, username, display_name").in("user_id", authorIds)
+    : { data: [] };
+
+  const profileMap = new Map((profiles ?? []).map((p) => [p.user_id, p]));
+
   const posts = (data ?? []).map((p: any) => ({
     id: p.id,
     title: p.title,
@@ -34,7 +37,7 @@ export async function fetchPosts({
     excerpt: p.excerpt,
     cover_image_url: p.cover_image_url,
     created_at: p.created_at,
-    author: p.profiles,
+    author: profileMap.get(p.author_id) || { username: "Anonymous", display_name: null },
     like_count: p.post_likes?.[0]?.count ?? 0,
     comment_count: p.comments?.[0]?.count ?? 0,
   }));
@@ -45,29 +48,43 @@ export async function fetchPosts({
 export async function fetchPostBySlug(slug: string) {
   const { data, error } = await supabase
     .from("posts")
-    .select(`
-      *,
-      profiles!posts_author_id_fkey(username, display_name, avatar_url)
-    `)
+    .select("*")
     .eq("slug", slug)
     .single();
 
   if (error) throw error;
-  return data;
+
+  // Fetch author profile
+  const { data: profile } = await supabase
+    .from("profiles")
+    .select("username, display_name, avatar_url")
+    .eq("user_id", data.author_id)
+    .single();
+
+  return { ...data, profiles: profile };
 }
 
 export async function fetchComments(postId: string) {
   const { data, error } = await supabase
     .from("comments")
-    .select(`
-      *,
-      profiles!comments_user_id_fkey(username, display_name, avatar_url)
-    `)
+    .select("*")
     .eq("post_id", postId)
     .order("created_at", { ascending: true });
 
   if (error) throw error;
-  return data ?? [];
+
+  // Fetch commenter profiles
+  const userIds = [...new Set((data ?? []).map((c) => c.user_id))];
+  const { data: profiles } = userIds.length > 0
+    ? await supabase.from("profiles").select("user_id, username, display_name, avatar_url").in("user_id", userIds)
+    : { data: [] };
+
+  const profileMap = new Map((profiles ?? []).map((p) => [p.user_id, p]));
+
+  return (data ?? []).map((c) => ({
+    ...c,
+    profiles: profileMap.get(c.user_id) || { username: "Anonymous", display_name: null, avatar_url: null },
+  }));
 }
 
 export async function fetchLikeStatus(postId: string, userId: string | undefined) {
@@ -127,15 +144,33 @@ export async function fetchUserPosts(userId: string) {
 export async function fetchUserBookmarks(userId: string) {
   const { data, error } = await supabase
     .from("bookmarks")
-    .select(`
-      id, created_at,
-      posts(id, title, slug, excerpt, cover_image_url, created_at, profiles!posts_author_id_fkey(username, display_name))
-    `)
+    .select("id, created_at, post_id")
     .eq("user_id", userId)
     .order("created_at", { ascending: false });
 
   if (error) throw error;
-  return data ?? [];
+
+  // Fetch the bookmarked posts
+  const postIds = (data ?? []).map((b) => b.post_id);
+  if (postIds.length === 0) return [];
+
+  const { data: posts } = await supabase
+    .from("posts")
+    .select("id, title, slug, excerpt, cover_image_url, created_at, author_id")
+    .in("id", postIds);
+
+  const authorIds = [...new Set((posts ?? []).map((p) => p.author_id))];
+  const { data: profiles } = authorIds.length > 0
+    ? await supabase.from("profiles").select("user_id, username, display_name").in("user_id", authorIds)
+    : { data: [] };
+
+  const profileMap = new Map((profiles ?? []).map((p) => [p.user_id, p]));
+  const postMap = new Map((posts ?? []).map((p) => [p.id, { ...p, author: profileMap.get(p.author_id) }]));
+
+  return (data ?? []).map((b) => ({
+    ...b,
+    posts: postMap.get(b.post_id) || null,
+  }));
 }
 
 export async function createPost(authorId: string, data: { title: string; content: string; excerpt: string; slug: string; cover_image_url?: string; published: boolean }) {
@@ -168,10 +203,6 @@ export async function uploadImage(file: File, userId: string) {
   return data.publicUrl;
 }
 
-function slugify(text: string) {
-  return text.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)+/g, "");
-}
-
 export function generateSlug(title: string) {
-  return slugify(title) + "-" + Math.random().toString(36).substring(2, 8);
+  return title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)+/g, "") + "-" + Math.random().toString(36).substring(2, 8);
 }
